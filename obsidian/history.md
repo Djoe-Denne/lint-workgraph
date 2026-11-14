@@ -1,7 +1,7 @@
 ---
 title: Project history
 created: 2026-11-14
-status: validated-awaiting-publication
+status: published
 ---
 
 # Project history
@@ -75,5 +75,27 @@ Explicit target-workspace tests cover separate tool/target commits, root
 misidentification, stale evidence and traversal. The collector no longer embeds a
 personal source path or assumes a particular Serena display project name.
 
-The extraction does not solve [[reproduction-gap]]. The public-exposure gate and
-actual publication reference remain to be verified.
+## Public publication
+
+Published on 2026-11-14:
+[Djoe-Denne/lint-workgraph](https://github.com/Djoe-Denne/lint-workgraph).
+GitHub visibility was verified as **PUBLIC**, with default branch `master`.
+The first published commit is
+`e1bccc17d4c04cb77e28fb3daa8b0a02bfd4dff6`; the remote branch matched that local
+commit after the initial push.
+
+The exact curated public candidate passed independent exposure/portability
+security review. A later four-file documentation delta added the user-requested
+quick-POC summary and backend directions; its full diff and staged hashes were
+rechecked before publication. No real captures, private environment or original
+application implementation were included.
+
+The README and vault now identify this as a quick POC. A Rust-focused successor
+should evaluate replacing both MCP integrations with a rust-analyzer-based
+backend; a Sonar-based analysis library is an alternative to investigate for
+broader language coverage. Neither replacement is implemented or validated, and
+no specific Sonar library has been selected.
+
+The extraction and publication do not solve [[reproduction-gap]]. License
+selection, broader live origin support and platform/server validation remain
+open in [[backlog]] and [[limitations]].
