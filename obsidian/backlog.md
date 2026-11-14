@@ -22,7 +22,8 @@ or an assertion that either backend is a drop-in equivalent.
 ## First priority: real cold-start usability
 
 - [ ] Define a minimal supported acquisition interface for Clippy and Sonar.
-- [ ] Persist a reusable plan-generation path with explicit source/query budgets.
+- [x] Replace manual final-stage seeds with automatic native discovery and
+      explicit source/query budgets over the full inventory.
 - [ ] Package and test independent source-binding preparation; current hashes
       alone must not manufacture historical equivalence.
 - [ ] Provide a durable launcher for the supported real-project pipeline.
@@ -30,8 +31,8 @@ or an assertion that either backend is a drop-in equivalent.
 
 ## Broader useful graph coverage
 
-- [ ] Generalize positive origin binding beyond the named compatibility profile,
-      one verified construct at a time.
+- [x] Add a generic native-identity path independent of the legacy named origin
+      profile, retaining unsupported cases and backend freshness warnings.
 - [ ] Add explicit supported responses/versions for MCP adapters.
 - [ ] Improve diagnostic-to-symbol coverage without erasing unsupported cases.
 - [ ] Establish Sonar coordinate conventions through reproducible evidence.

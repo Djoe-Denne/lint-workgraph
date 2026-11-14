@@ -99,3 +99,40 @@ no specific Sonar library has been selected.
 The extraction and publication do not solve [[reproduction-gap]]. License
 selection, broader live origin support and platform/server validation remain
 open in [[backlog]] and [[limitations]].
+
+## Simplified locality policy
+
+The user subsequently chose to avoid signature/body reasoning for first-pass
+routing: all rules are transverse unless manifestly local. The new standalone
+`diagnostic-scope.py` implements explicit documentation/mechanical local exceptions
+and a conservative default for all other known or unknown rules.
+
+Applied to the saved inventory, all 77 observed rule types were recognized.
+All 1,046 records were retained; the strict union of 620 routes to 328 local
+and 292 transverse. The original 1,312 Sonar keys route to 644 local and
+668 transverse. No dependency queries or fixes were performed for this routing.
+This does not turn the 292 candidates into proven transverse corrections or
+hard co-edit groups.
+
+## Whole-inventory dependency command
+
+The final command was generalized to use the existing native Rust graph, without
+manual seeds or the legacy one-symbol origin profile. Real collection processed
+all 1,046 records: 584 local skips and 462 transverse attempts (336 query-served,
+126 unresolved localization). No records remained pending or budget-stopped.
+
+The completed native capture contains 9,348 observations: 5,156 source-verified,
+2,792 backend-observed and 1,400 unresolved. Its final file graph has 256 nodes,
+517 candidate coupling edges and 289 distinct cross-file boundaries, with all
+records retained and zero consumer validation issues.
+
+Measured successful stages: native collection 110.93 seconds; subsequent
+validation/assembly/publication 144.27 seconds using the same completed capture,
+without recollecting. The collector and actual final-command assembly functions
+were exercised on real data; a second live unified CLI run was not performed.
+The callable CLI wiring is covered by synthetic tests.
+
+An inventory read/hash race and a quadratic raw/source alias check were corrected
+with regressions. Partial backend coverage, stale-snapshot warnings and unresolved
+native endpoints remain explicit. No index rebuild, source corrections, hard
+co-edit unions or correction-worker dispatch occurred.

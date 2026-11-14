@@ -12,15 +12,18 @@ import ipaddress
 import hashlib
 import json
 import math
+import importlib.util
 import os
 import re
 from pathlib import Path
 import sys
 import subprocess
 import tempfile
+import time
 import tomllib
 from urllib.parse import urlsplit, urlunsplit
 from clippy_source_ranges import verify_function_range
+import clippy_source_ranges as source_ranges
 
 DEFAULT_URL = "http://127.0.0.1:3062/mcp?tags=rust-code-mcp"
 TOOL_ROOT = Path(__file__).resolve().parents[2]
@@ -1632,6 +1635,875 @@ def producer_main(args):
         # Fresh raw artifacts may remain for diagnosis; never replace accepted
         # snapshot/evidence on collection/validation failure.
         return 1
+
+
+NATIVE_TOOLS = {
+    "crate_dependency_metric", "crate_edges", "module_tree", "build_codemap",
+    "who_uses", "calls_from", "who_imports",
+}
+NATIVE_INVENTORY_MAX_BYTES = 64 * 1024 * 1024
+
+
+def read_native_inventory(path):
+    """Parse and identify the same bounded bytes, regardless of path replacement."""
+    with path.open("rb") as handle:
+        raw = handle.read(NATIVE_INVENTORY_MAX_BYTES + 1)
+    if len(raw) > NATIVE_INVENTORY_MAX_BYTES:
+        raise EvidenceError("Native inventory exceeds 64 MiB")
+    inventory = json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object,
+                           parse_constant=lambda _: (_ for _ in ()).throw(
+                               EvidenceError("Non-finite JSON number")))
+    return inventory, hashlib.sha256(raw).hexdigest()
+
+
+def native_selector(value):
+    if (not isinstance(value, str) or not value.strip() or len(value) > 4096
+            or any(c in value for c in "/\\\r\n\x00") or ".." in value or "://" in value):
+        raise EvidenceError("Native selector must be a qualified graph name, not a path")
+    return value
+
+
+class NativeCapture:
+    """Generic read-only graph capture; uses the existing SDK connection owner."""
+
+    def __init__(self, session, tools, workspace, directory, limit, deadline):
+        self.session, self.tools = session, tools
+        self.workspace, self.directory = workspace, directory
+        self.limit, self.deadline = limit, deadline
+        self.queries, self.cache = [], {}
+        self.stopped = None
+        self.reused = 0
+        self.requests = 0
+
+    async def query(self, suffix, arguments):
+        if suffix not in NATIVE_TOOLS or arguments.get("directory") != str(self.workspace):
+            raise EvidenceError("Generic native request is not an authorized tool/root")
+        key = json.dumps([suffix, arguments], sort_keys=True, separators=(",", ":"))
+        if key in self.cache:
+            payload, query = self.cache[key]
+            query["reused_count"] += 1
+            self.reused += 1
+            return payload, query
+        if time.monotonic() >= self.deadline:
+            self.stopped = "not_attempted_deadline"
+            return None, None
+        if len(self.queries) >= self.limit:
+            self.stopped = "not_attempted_budget"
+            return None, None
+        exact = "rust-code-mcp_1mcp_" + suffix
+        query = {
+            "id": f"nq{len(self.queries) + 1:06d}", "tool": exact,
+            "arguments": arguments, "artifact": None, "artifact_sha256": None,
+            "status": "pending",
+            "pagination": {"status": "unknown", "pages": 1, "returned": 0, "total": None,
+                           "reason": "Result not validated"},
+            "limitations": [], "duration_seconds": 0.0, "reused_count": 0,
+        }
+        self.queries.append(query)
+        artifact = self.directory / (query["id"] + ".json")
+        query["artifact"] = artifact.relative_to(self.directory).as_posix()
+        start, payload, raw = time.monotonic(), None, None
+        try:
+            matches = [t for t in self.tools if t.get("name", "").endswith("_1mcp_" + suffix)]
+            if len(matches) != 1 or matches[0]["name"] != exact:
+                query["status"] = "unavailable"
+                raise EvidenceError("Native tool missing/ambiguous: " + suffix)
+            schema = matches[0].get("inputSchema", {})
+            if (not set(arguments) <= set(schema.get("properties", {}))
+                    or not set(schema.get("required", [])) <= set(arguments)):
+                query["status"] = "unsupported"
+                raise EvidenceError("Native tool argument schema drift: " + suffix)
+            self.requests += 1
+            raw = as_json(await self.session.call_tool(exact, arguments=arguments))
+            if len(json.dumps(raw).encode("utf-8")) > MAX_RESULT_BYTES:
+                raw = None
+                raise EvidenceError("Native result exceeds capture byte budget")
+            atomic_json(artifact, raw)
+            payload = decode_wire(raw)
+            query["status"] = "ok"
+        except asyncio.CancelledError:
+            query["status"] = "timeout"
+            query["limitations"].append("Whole-operation deadline interrupted this query")
+            raise
+        except Exception as exc:
+            if query["status"] == "pending":
+                query["status"] = "error"
+            query["limitations"].append(str(exc) if isinstance(exc, EvidenceError) else type(exc).__name__)
+        finally:
+            if not artifact.exists():
+                atomic_json(artifact, raw if raw is not None else {"failure": query["status"]})
+            query["artifact_sha256"] = sha256(artifact)
+            query["duration_seconds"] = max(0.0, time.monotonic() - start)
+            self.cache[key] = (payload, query)
+        return payload, query
+
+
+async def native_pages(capture, suffix, selector, page_size, max_pages, row_budget=None):
+    """Validate observed native count envelopes; no offset repair or retries."""
+    shapes = {
+        "crate_dependency_metric": ("metrics", None),
+        "who_uses": ("usages", "target"),
+        "calls_from": ("call_sites", "caller"),
+        "who_imports": ("bindings", "target"),
+    }
+    rows_key, selector_key = shapes[suffix]
+    offset, total, rows, queries, seen = 0, None, [], [], set()
+    state, reason = "partial", "Page budget exhausted"
+    for _ in range(max_pages):
+        if row_budget is not None and len(rows) >= row_budget:
+            capture.stopped = "not_attempted_budget"
+            reason = "Dependency row budget exhausted; prior page retained in full"
+            break
+        arguments = {"directory": str(capture.workspace), "limit": page_size,
+                     "offset": offset, "summary": False}
+        if selector_key:
+            arguments[selector_key] = native_selector(selector)
+        try:
+            payload, query = await capture.query(suffix, arguments)
+        except asyncio.CancelledError:
+            if time.monotonic() < capture.deadline:
+                raise
+            capture.stopped = "not_attempted_deadline"
+            reason = capture.stopped
+            if capture.queries and capture.queries[-1] not in queries:
+                queries.append(capture.queries[-1])
+            break
+        if query is None:
+            reason = capture.stopped
+            break
+        queries.append(query)
+        if query["status"] != "ok":
+            reason = "Backend query unavailable/error/unsupported"
+            break
+        try:
+            if not isinstance(payload, dict) or not isinstance(payload.get(rows_key), list):
+                raise EvidenceError("Unsupported native page envelope: " + suffix)
+            values = payload[rows_key]
+            count, current_total = payload.get("returned_match_count"), payload.get("total_match_count")
+            if (type(count) is not int or type(current_total) is not int
+                    or not 0 <= count <= page_size or current_total < 0
+                    or count != len(values) or type(payload.get("offset")) is not int
+                    or payload["offset"] != offset or type(payload.get("limit")) is not int
+                    or payload["limit"] != page_size or payload.get("summary") is not False
+                    or (selector_key and payload.get(selector_key) != selector)
+                    or offset + count > current_total or (total is not None and total != current_total)):
+                raise EvidenceError("Native pagination gap/total/count drift")
+            total = current_total
+            identities = [json.dumps(row, sort_keys=True, separators=(",", ":")) for row in values]
+            if (not all(isinstance(row, dict) for row in values)
+                    or len(set(identities)) != len(identities) or seen.intersection(identities)):
+                raise EvidenceError("Repeated native page/row")
+            if not count and offset != total:
+                raise EvidenceError("Non-progress native page")
+            seen.update(identities)
+            rows.extend((row, query["id"]) for row in values)
+            offset += count
+            if offset == total:
+                state, reason = "complete", "Count-complete indexed query scope only"
+                break
+        except EvidenceError as exc:
+            query["status"] = "unsupported"
+            query["limitations"].append(str(exc))
+            reason = str(exc)
+            # Preserve malformed-page facts too, but never qualify them through
+            # a failed envelope or silently repair their offset/total.
+            if isinstance(payload, dict) and isinstance(payload.get(rows_key), list):
+                rows.extend((row, query["id"]) for row in payload[rows_key] if isinstance(row, dict))
+            break
+    pagination = {"status": state if rows or queries else "unknown", "pages": len(queries),
+                  "returned": len(rows), "total": total, "reason": reason}
+    for query in queries:
+        query["pagination"] = dict(pagination)
+        if state != "complete" and query["status"] == "ok":
+            query["status"] = "partial"
+    return rows, queries, pagination
+
+
+def native_location(data, node, parsed=None):
+    """Current native byte/header correspondence, not a full Rust resolver."""
+    span, line = node.get("span"), node.get("line")
+    if (not isinstance(span, list) or len(span) != 2
+            or any(type(n) is not int for n in span) or type(line) is not int
+            or not 0 <= span[0] < span[1] <= len(data)):
+        raise EvidenceError("Missing/invalid native byte bounds")
+    start, end = span
+    if data[:start].count(b"\n") + 1 != line:
+        raise EvidenceError("Native line does not match current byte position")
+    try:
+        text, before, selected = data.decode("utf-8"), data[:start].decode("utf-8"), data[start:end].decode("utf-8")
+    except UnicodeError:
+        raise EvidenceError("Native span splits UTF-8 source") from None
+    structure = parsed[0] if parsed else source_ranges._structure(text)
+    if structure[2]:
+        raise EvidenceError("Unsupported source lexical state")
+    tokens = structure[0]
+    name = node["qualified_name"].rsplit("::", 1)[-1].removeprefix("r#")
+    kind = node.get("item_kind") or node.get("kind")
+    expected = {
+        "Function": "fn", "Fn": "fn", "Method": "fn", "Struct": "struct",
+        "Trait": "trait", "Enum": "enum", "Union": "union", "Module": "mod",
+        "TypeAlias": "type", "Type": "type", "Const": "const", "Static": "static",
+    }.get(str(kind).removeprefix("Item."))
+    if expected is None:
+        raise EvidenceError("Unsupported native declaration kind")
+    matches = []
+    for declaration in (parsed[1] if parsed else source_ranges._declarations(text, structure)):
+        index = declaration["token"]
+        starts = declaration["doc_starts"] + [declaration["start"], declaration["code_start"]]
+        if (declaration["type"] == expected and len(before) in starts
+                and declaration["end"] == len(before) + len(selected)
+                and index + 1 < len(tokens) and tokens[index + 1].kind == "identifier"
+                and tokens[index + 1].text.removeprefix("r#") == name):
+            matches.append(declaration)
+    if len(matches) != 1:
+        raise EvidenceError("Native span/kind/name does not identify one current declaration")
+    return {"start_byte": start, "end_byte": end, "start_line": line,
+            "end_line": data[:end - 1].count(b"\n") + 1, "column_unit": "utf8_byte"}
+
+
+class NativeRun:
+    """Small capture state; native facts remain separate from current projection."""
+
+    def __init__(self, workspace, directory, inventory_path, protected, limits, initial_inventory_digest):
+        self.workspace, self.directory, self.inventory_path = workspace, directory, inventory_path
+        self.protected = protected
+        self.sources, self.parsed, self.tree, self.by_native, self.by_selector = {}, {}, {}, {}, {}
+        self.source_bytes = 0
+        self.limits, self.item_queries, self.relation_rows = limits, {}, {}
+        self.capture = {
+            "schema_version": 1, "kind": "lint-native-dependency-capture", "status": "pending",
+            "workspace": str(workspace), "artifact_root": str(directory),
+            "orientation": "consumer_to_provider",
+            "inventory_sha256": initial_inventory_digest, "captured_at": datetime.now(timezone.utc).isoformat(),
+            "target_head": git_head(workspace), "source_files": [],
+            "backend": {"server_ref": None, "catalogue_ref": None,
+                        "workspace_evidence": {"status": "requested_directory_only",
+                                               "requested_workspace": str(workspace)},
+                        "snapshot_ids": [], "warnings": [], "coverage": coverage(),
+                        "scope": "direct_incoming_outgoing_imports_selected_transverse_items", "context_refs": []},
+            "queries": [], "items": [], "diagnostics": [], "dependencies": [],
+            "limits": dict(limits), "timing": {"total_seconds": 0.0, "stages": {},
+                                             "requests": 0, "reused_queries": 0},
+            "limitations": [
+                "Native graph coverage/features/tests/macros and global freshness are not proved.",
+                "Directory is requested explicitly; native payloads do not independently report an indexed root.",
+                "Current endpoint checks do not establish historical diagnostic/source equivalence.",
+                "Direct incoming/outgoing/import scopes only; not recursive exhaustive workspace closure.",
+                "Candidate native dependencies are not hard co-edit constraints or dispatch authorization.",
+            ],
+        }
+        self.start = time.monotonic()
+        self.deadline = self.start + limits["timeout"]
+        self.transport = None
+        self.stop_reason = None
+
+    def protect(self, path):
+        if path.is_relative_to(self.directory):
+            raise CaptureIntegrityError("A native source/input aliases the run-artifact directory")
+        try:
+            verify_output_input_separation(self.protected, [path])
+        except EvidenceError as exc:
+            raise CaptureIntegrityError(str(exc)) from None
+
+    def source(self, raw):
+        name, path = source_path(self.workspace, raw)
+        self.protect(path)
+        if name not in self.sources:
+            if path.stat().st_size > MAX_RESULT_BYTES:
+                raise SourcePathError("Native source exceeds per-file byte budget")
+            data = path.read_bytes()
+            if self.source_bytes + len(data) > MAX_SOURCE_BYTES:
+                raise SourcePathError("Native aggregate source byte budget exhausted")
+            self.source_bytes += len(data)
+            digest = hashlib.sha256(data).hexdigest()
+            self.sources[name] = {"path": name, "sha256": digest, "before_sha256": digest,
+                                  "after_sha256": None, "status": "pending", "_data": data}
+        return name, self.sources[name]
+
+    def item(self, node, query_ids, snapshot):
+        native_id = node.get("id")
+        if (not isinstance(native_id, list) or not native_id
+                or any(type(n) is not int or not 0 <= n <= 255 for n in native_id)):
+            raise EvidenceError("Unsupported native ID byte array")
+        selector = native_selector(node.get("qualified_name"))
+        identity = (snapshot, tuple(native_id))
+        if identity in self.by_native:
+            current = self.by_native[identity]
+            if (current["selector"] != selector
+                    or current["native"] != {k: node.get(k) for k in ("file", "span", "line")}):
+                current["location_status"] = "candidate"
+                current["reasons"].append("Conflicting location/selector for the same native ID")
+            current["evidence_refs"] = sorted(set(current["evidence_refs"] + query_ids))
+            return current
+        entry = {
+            "id": f"ni{len(self.capture['items']) + 1:06d}", "native_id": native_id,
+            "selector": selector, "kind": node.get("item_kind") or node.get("kind") or "unknown",
+            "visibility": self.tree.get(selector, {}).get("visibility"),
+            "path": None, "range": None, "location_status": "unknown", "source_sha256": None,
+            "snapshot_id": snapshot, "native": {k: node.get(k) for k in ("file", "span", "line")},
+            "evidence_refs": sorted(set(query_ids)), "reasons": [],
+        }
+        self.capture["items"].append(entry)
+        self.by_native[identity] = entry
+        self.by_selector.setdefault(selector, []).append(entry)
+        try:
+            name, record = self.source(node.get("file"))
+            entry.update(path=name, source_sha256=record["sha256"], location_status="candidate")
+            if name not in self.parsed:
+                text = record["_data"].decode("utf-8")
+                structure = source_ranges._structure(text)
+                self.parsed[name] = (structure, source_ranges._declarations(text, structure))
+            entry["range"] = native_location(record["_data"], node, self.parsed[name])
+            entry["location_status"] = "verified"
+        except (SourcePathError, UnicodeError, OSError) as exc:
+            entry["reasons"].append(str(exc))
+        except EvidenceError as exc:
+            # A collision is not a weak endpoint: it is a fatal publication guard.
+            if node.get("file") and isinstance(node["file"], str):
+                try:
+                    _, absolute = source_path(self.workspace, node["file"])
+                except EvidenceError:
+                    pass
+                else:
+                    self.protect(absolute)
+            entry["reasons"].append(str(exc))
+        return entry
+
+    def unlocated(self, selector, refs, reason):
+        entry = {
+            "id": f"ni{len(self.capture['items']) + 1:06d}", "native_id": None, "selector": selector,
+            "kind": self.tree.get(selector, {}).get("kind", "unknown"),
+            "visibility": self.tree.get(selector, {}).get("visibility"), "path": None, "range": None,
+            "location_status": "unknown", "source_sha256": None, "snapshot_id": None,
+            "native": {"file": None, "span": None, "line": None},
+            "evidence_refs": sorted(set(refs)), "reasons": [reason],
+        }
+        self.capture["items"].append(entry)
+        return entry
+
+    def unique(self, selector):
+        matches = self.by_selector.get(selector, [])
+        return matches[0] if len(matches) == 1 else None
+
+    def diagnostic_queue(self, inventory):
+        spec = importlib.util.spec_from_file_location(
+            "_native_scope_router", Path(__file__).with_name("diagnostic-scope.py"))
+        router = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(router)
+        routed = router.route_inventory(inventory)
+        spans_by_key = {key: spans for key, _, spans in diagnostic_rows(inventory)}
+        self.spans = spans_by_key
+        for route in routed["diagnostics"]:
+            entry = {"diagnostic_key": route["diagnostic_key"], "route": route["scope"],
+                     "files": [], "item_ids": [], "query_ids": [], "attempt_outcome": "pending",
+                     "localization_status": "unknown", "reasons": []}
+            for span in spans_by_key[route["diagnostic_key"]]:
+                raw = span.get("file")
+                try:
+                    name, _ = self.source(raw)
+                    entry["files"].append(name)
+                except (SourcePathError, OSError) as exc:
+                    # Root-invalid or nonexistent diagnostic nodes remain visible.
+                    if isinstance(raw, str):
+                        entry["files"].append(raw.replace("\\", "/"))
+                    entry["reasons"].append(str(exc))
+            entry["files"] = sorted(set(entry["files"]))
+            if entry["route"] == "local":
+                entry["attempt_outcome"] = "skipped_local"
+            self.capture["diagnostics"].append(entry)
+
+    def select(self):
+        for diagnostic in self.capture["diagnostics"]:
+            if diagnostic["route"] == "local":
+                continue
+            selected = []
+            for path in diagnostic["files"]:
+                candidates = [i for i in self.capture["items"] if i["path"] == path]
+                # Without independent historical source equivalence an old
+                # line can fall into a different current item. Keep all file
+                # candidates; requests are deduplicated across diagnostics.
+                selected.extend(candidates)
+            diagnostic["item_ids"] = sorted({i["id"] for i in selected})
+            diagnostic["query_ids"] = sorted({ref for i in selected for ref in i["evidence_refs"]})
+            if selected:
+                diagnostic["localization_status"] = "candidate"
+                diagnostic["reasons"].append(
+                    "All current file-bound native candidates; no historical source binding asserted")
+            else:
+                diagnostic["attempt_outcome"] = "unresolved_localization"
+                diagnostic["reasons"].append("No positively file-bound native item; discovery is not absence proof")
+
+    async def hydrate(self, selectors):
+        pending = sorted({native_selector(s) for s in selectors})
+        batch_size = self.limits["hydration_batch_size"]
+        for at in range(0, len(pending), batch_size):
+            batch = pending[at:at + batch_size]
+            if len(self.capture["items"]) >= self.limits["max_items"]:
+                self.transport.stopped = "not_attempted_budget"
+                self.capture["limitations"].append(f"Item budget: {len(pending) - at} native selectors unexpanded")
+                break
+            payload, query = await self.transport.query("build_codemap", {
+                "directory": str(self.workspace), "seed_qualified_names": batch,
+                "depth": 0, "max_nodes": 500, "embedding_policy": "no_rerank",
+                "format": "json", "include_snippets": False})
+            if query is None:
+                break
+            refs = [query["id"]]
+            found = set()
+            try:
+                if (query["status"] != "ok" or not isinstance(payload, dict)
+                        or not isinstance(payload.get("nodes"), list)
+                        or not isinstance(payload.get("edges"), list)
+                        or not isinstance(payload.get("snapshot_id"), str) or not payload["snapshot_id"]):
+                    raise EvidenceError("Unsupported native node hydration envelope")
+                snapshot = payload["snapshot_id"]
+                if snapshot not in self.capture["backend"]["snapshot_ids"]:
+                    self.capture["backend"]["snapshot_ids"].append(snapshot)
+                warnings = payload.get("diagnostics", [])
+                if isinstance(warnings, list):
+                    self.capture["backend"]["warnings"].extend(str(v) for v in warnings)
+                # No edge is inferred from depth zero. Unexpected returned facts
+                # are preserved for endpoint resolution rather than discarded.
+                for index, node in enumerate(payload["nodes"]):
+                    try:
+                        if not isinstance(node, dict):
+                            raise EvidenceError("Malformed native node")
+                        node_refs = refs + self.tree.get(node.get("qualified_name"), {}).get("refs", [])
+                        item = self.item(node, node_refs, snapshot)
+                        found.add(item["selector"])
+                    except CaptureIntegrityError:
+                        raise
+                    except EvidenceError as exc:
+                        query["limitations"].append(f"Unresolved native node {index}: {exc}; raw fact retained")
+                for edge in payload["edges"]:
+                    self.relation_rows.setdefault(("codemap", snapshot), []).append((edge, query["id"]))
+                query["pagination"] = {
+                    "status": "not_applicable", "pages": 1, "returned": len(payload["nodes"]),
+                    "total": None, "reason": "Depth-zero node hydration, not dependency pagination"}
+                if len(payload["nodes"]) >= 500:
+                    query["limitations"].append("Native node cap reached; seed correspondence may be incomplete")
+            except CaptureIntegrityError:
+                raise
+            except EvidenceError as exc:
+                query["status"] = "unsupported" if query["status"] == "ok" else query["status"]
+                query["limitations"].append(str(exc))
+            for selector in batch:
+                self.item_queries[selector] = refs
+                if selector not in found:
+                    self.unlocated(selector, refs + self.tree.get(selector, {}).get("refs", []),
+                                   "Seed missing/unsupported in native hydration; no guessed location")
+            if self.transport.stopped:
+                break
+
+    async def discover(self):
+        rows, queries, pagination = await native_pages(
+            self.transport, "crate_dependency_metric", None,
+            self.limits["page_size"], self.limits["max_pages"])
+        if pagination["status"] != "complete":
+            self.capture["limitations"].append("Crate enumeration incomplete: " + str(pagination["reason"]))
+        edges, edge_query = await self.transport.query("crate_edges", {
+            "directory": str(self.workspace), "offset": 0,
+            "limit": self.limits["page_size"], "summary": False})
+        if edge_query:
+            self.capture["backend"]["context_refs"].append(edge_query["id"])
+            returned = edges.get("returned_match_count") if isinstance(edges, dict) else None
+            if type(returned) is not int or returned < 0:
+                returned = (len(edges["edges"]) if isinstance(edges, dict)
+                            and isinstance(edges.get("edges"), list) else 0)
+            edge_query["pagination"] = {
+                "status": "partial", "pages": 1,
+                "returned": returned,
+                "total": edges.get("total_match_count") if isinstance(edges, dict)
+                         and type(edges.get("total_match_count")) is int else None,
+                "reason": "Single bounded crate-context page; not global crate-edge enumeration",
+            }
+            edge_query["limitations"].append(
+                "Crate edges are bounded context only; all selected item relation sequences are accounted separately")
+        crates = set()
+        for row, _ in rows:
+            try:
+                crates.add(native_selector(row.get("crate_name")))
+            except EvidenceError:
+                self.capture["limitations"].append("Crate metric row lacks a usable selector")
+        for crate in sorted(crates):
+            payload, query = await self.transport.query("module_tree", {
+                "directory": str(self.workspace), "krate": crate})
+            if query is None:
+                break
+            if (query["status"] != "ok" or not isinstance(payload, dict)
+                    or not isinstance(payload.get("tree"), dict)):
+                query["limitations"].append("Unusable full module tree; no fabricated children")
+                continue
+            stack = [payload["tree"]]
+            visited = 0
+            while stack:
+                node = stack.pop()
+                visited += 1
+                if visited > self.limits["max_items"]:
+                    query["limitations"].append("Module tree item budget; unexpanded subtree retained in raw capture")
+                    self.transport.stopped = "not_attempted_budget"
+                    break
+                try:
+                    selector = native_selector(node.get("qualified_name"))
+                    children = node.get("children")
+                    if not isinstance(children, list) or not all(isinstance(c, dict) for c in children):
+                        raise EvidenceError("Unsupported native tree children")
+                except EvidenceError as exc:
+                    query["limitations"].append(str(exc))
+                    continue
+                current = self.tree.setdefault(selector, {
+                    "kind": node.get("item_kind") or node.get("kind") or "unknown",
+                    "visibility": node.get("visibility"), "refs": []})
+                current["refs"] = sorted(set(current["refs"] + [query["id"]]))
+                if current["visibility"] is None:
+                    current["visibility"] = node.get("visibility")
+                stack.extend(reversed(children))
+            query["pagination"] = {"status": "not_applicable", "pages": 1, "returned": visited,
+                                   "total": None, "reason": "Uncapped recursive tree; no cursor or completeness proof"}
+    async def relations(self):
+        self.pre_relation_sources = set(self.sources)
+        selected_ids = {identifier for d in self.capture["diagnostics"] for identifier in d["item_ids"]}
+        selected = [item for item in self.capture["items"] if item["id"] in selected_ids]
+        served = {}
+        for item in selected:
+            selector = item["selector"]
+            if selector in served:
+                continue
+            query_ids, attempted = [], False
+            for suffix in ("who_uses", "calls_from", "who_imports"):
+                kinds = {str(i["kind"]).removeprefix("Item.") for i in selected if i["selector"] == selector}
+                if suffix == "calls_from" and not kinds.intersection({"Function", "Fn", "Method"}):
+                    item["reasons"].append("calls_from not applicable to this non-function native kind")
+                    continue
+                if len(self.capture["dependencies"]) >= self.limits["max_dependencies"]:
+                    self.transport.stopped = "not_attempted_budget"
+                    break
+                remaining = self.limits["max_dependencies"] - sum(len(rows) for rows in self.relation_rows.values())
+                if remaining <= 0:
+                    self.transport.stopped = "not_attempted_budget"
+                    break
+                rows, queries, pagination = await native_pages(
+                    self.transport, suffix, selector, self.limits["page_size"], self.limits["max_pages"], remaining)
+                attempted |= any(q["status"] in ("ok", "partial") for q in queries)
+                query_ids.extend(q["id"] for q in queries)
+                self.relation_rows[(suffix, selector)] = rows
+                if pagination["status"] != "complete":
+                    self.capture["limitations"].append(f"{suffix} {selector}: {pagination['reason']}")
+                if self.transport.stopped:
+                    break
+            served[selector] = {"query_ids": query_ids, "attempted": attempted,
+                                "outcome": self.transport.stopped or ("queried" if attempted else "unavailable_backend")}
+            if self.transport.stopped:
+                break
+        # Only direct returned endpoint selectors are hydrated. This is not
+        # recursive relation expansion and does not alter the diagnostic queue.
+        endpoint_selectors = set()
+        for (suffix, _), rows in self.relation_rows.items():
+            for row, _ in rows:
+                fields = (("consumer_function", "consumer_module") if suffix == "who_uses" else
+                          ("callee_qualified_name",) if suffix == "calls_from" else
+                          ("from_module",) if suffix == "who_imports" else ())
+                for field in fields:
+                    if field in row:
+                        try:
+                            endpoint_selectors.add(native_selector(row[field]))
+                        except EvidenceError:
+                            pass
+        known = set(self.item_queries) | {i["selector"] for i in self.capture["items"] if i["native_id"]}
+        missing = endpoint_selectors - known
+        if missing and not self.transport.stopped:
+            await self.hydrate(missing)
+        self.dependencies()
+        assigned = set()
+        assignments = 0
+        for diagnostic in self.capture["diagnostics"]:
+            if diagnostic["route"] == "local":
+                continue
+            selectors = sorted({i["selector"] for i in selected if i["id"] in diagnostic["item_ids"]})
+            outcomes = [served[s] for s in selectors if s in served]
+            ids = sorted({q for outcome in outcomes for q in outcome["query_ids"]})
+            diagnostic["query_ids"] = sorted(set(diagnostic["query_ids"] + ids))
+            if not selectors:
+                if self.transport.stopped:
+                    diagnostic["attempt_outcome"] = self.transport.stopped
+                continue
+            if len(outcomes) != len(selectors) or any(o["outcome"].startswith("not_attempted") for o in outcomes):
+                diagnostic["attempt_outcome"] = self.transport.stopped or "not_attempted_budget"
+            elif any(o["attempted"] for o in outcomes):
+                diagnostic["attempt_outcome"] = "reused_query" if set(ids) <= assigned else "queried"
+            else:
+                diagnostic["attempt_outcome"] = "unavailable_backend"
+            for identifier in set(ids) & assigned:
+                query = next(q for q in self.transport.queries if q["id"] == identifier)
+                query["reused_count"] += 1
+                assignments += 1
+            assigned.update(ids)
+        self.capture["timing"]["reused_query_assignments"] = assignments
+
+    def dependencies(self):
+        for (suffix, selector), rows in self.relation_rows.items():
+            for row, query_id in rows:
+                reasons, origin, destination, origin_path, destination_path = [], None, None, None, None
+                native_origin, native_destination = {}, {}
+                source_ok = False
+                if not isinstance(row, dict):
+                    row = {"unsupported_row": row}
+                try:
+                    if suffix == "codemap":
+                        def by_id(value):
+                            return self.by_native.get((selector, tuple(value))) if isinstance(value, list) else None
+                        origin, destination = by_id(row.get("from")), by_id(row.get("to"))
+                        native_origin, native_destination = {"id": row.get("from")}, {"id": row.get("to")}
+                        source_ok = True
+                        reasons.append("Unexpected depth-zero edge retained as backend context, not a paginated relation")
+                    else:
+                        target = self.unique(selector)
+                        if suffix == "who_imports":
+                            if row.get("target") != selector:
+                                raise EvidenceError("Importer row target mismatch")
+                            native_selector(row.get("from_module"))
+                            origin, destination = self.unique(row.get("from_module")), target
+                            native_origin = {"selector": row.get("from_module")}
+                            native_destination = {"selector": selector}
+                            source_ok = True
+                        else:
+                            caller = row.get("consumer_function") if suffix == "who_uses" else selector
+                            callee = selector if suffix == "who_uses" else row.get("callee_qualified_name")
+                            if caller is not None:
+                                native_selector(caller)
+                            native_selector(callee)
+                            if suffix == "calls_from" and row.get("caller_qualified_name") != selector:
+                                raise EvidenceError("Outgoing row caller mismatch")
+                            origin, destination = self.unique(caller), self.unique(callee)
+                            native_origin = {"selector": caller, "module": row.get("consumer_module"),
+                                             "file": row.get("file"), "span": [row.get("start"), row.get("end")]}
+                            native_destination = {"selector": callee}
+                            name, source = self.source(row.get("file"))
+                            origin_path = name
+                            start, end = row.get("start"), row.get("end")
+                            if (type(start) is not int or type(end) is not int
+                                    or not 0 <= start < end <= len(source["_data"])
+                                    or not isinstance(callee, str)
+                                    or source["_data"][start:end].decode("utf-8") != callee.rsplit("::", 1)[-1]):
+                                raise EvidenceError("Reference byte bounds/spelling mismatch; no repair")
+                            if origin and (origin["path"] != name or not origin["range"]
+                                           or not origin["range"]["start_byte"] <= start < end <= origin["range"]["end_byte"]):
+                                reasons.append("Reference site does not establish advertised caller identity")
+                                origin = None
+                            source_ok = True
+                    origin_path = origin_path or (origin["path"] if origin else None)
+                    destination_path = destination["path"] if destination else None
+                except (SourcePathError, UnicodeError) as exc:
+                    reasons.append(str(exc))
+                except EvidenceError as exc:
+                    # Recheck protection separately: collisions are never
+                    # downgraded into ordinary backend-observed endpoints.
+                    if isinstance(row.get("file"), str):
+                        try:
+                            _, absolute = source_path(self.workspace, row["file"])
+                        except EvidenceError:
+                            pass
+                        else:
+                            self.protect(absolute)
+                    reasons.append(str(exc))
+                origin_path = origin_path or (origin["path"] if origin else None)
+                destination_path = destination_path or (destination["path"] if destination else None)
+                if any(path and path not in getattr(self, "pre_relation_sources", set())
+                       for path in (origin_path, destination_path)):
+                    reasons.append("Endpoint first hashed after relation queries; no pre-query source stability")
+                endpoint_checks = bool(destination and destination["location_status"] == "verified"
+                                       and (origin is None and suffix == "who_uses"
+                                            or origin and origin["location_status"] == "verified"))
+                query = next(q for q in self.transport.queries if q["id"] == query_id)
+                if query["status"] not in ("ok", "partial"):
+                    reasons.append("Raw relation page failed envelope/pagination validation")
+                qualification = ("source_verified" if source_ok and endpoint_checks and not reasons else
+                                 "backend_observed" if origin_path and destination_path else "unresolved")
+                if qualification != "source_verified" and not reasons:
+                    reasons.append("Native endpoint identity/current declaration is missing or ambiguous")
+                kind = row.get("kind", "Uses" if suffix == "who_uses" else
+                               "CallsFrom" if suffix == "calls_from" else "Imports")
+                if not isinstance(kind, str) or not kind:
+                    kind = "unknown"
+                self.capture["dependencies"].append({
+                    "id": f"nd{len(self.capture['dependencies']) + 1:06d}",
+                    "kind": kind,
+                    "origin_item_id": origin["id"] if origin else None,
+                    "destination_item_id": destination["id"] if destination else None,
+                    "origin_path": origin_path, "destination_path": destination_path,
+                    "native_origin": native_origin, "native_destination": native_destination,
+                    "native": row, "evidence_refs": [query_id], "qualification": qualification, "reasons": reasons,
+                    "snapshot_ids": sorted({i["snapshot_id"] for i in (origin, destination)
+                                             if i and i["snapshot_id"]}),
+                })
+
+    def finalize(self):
+        for name, record in self.sources.items():
+            try:
+                _, path = source_path(self.workspace, name)
+                self.protect(path)
+                record["after_sha256"] = sha256(path)
+                record["status"] = "verified" if record["after_sha256"] == record["before_sha256"] else "changed"
+            except (SourcePathError, OSError):
+                record["status"] = "missing"
+            if record["status"] != "verified":
+                for item in self.capture["items"]:
+                    if item["path"] == name:
+                        item["location_status"] = "candidate"
+                        item["reasons"].append("Source changed/disappeared during capture")
+                for diagnostic in self.capture["diagnostics"]:
+                    if name in diagnostic["files"] and diagnostic["route"] != "local":
+                        diagnostic.update(attempt_outcome="source_invalid", localization_status="source_invalid")
+                for dependency in self.capture["dependencies"]:
+                    if name in (dependency["origin_path"], dependency["destination_path"]):
+                        dependency["qualification"] = (
+                            "unresolved" if record["status"] == "missing" else "backend_observed")
+                        dependency["reasons"].append("Endpoint source changed/disappeared during capture")
+        self.capture["source_files"] = [{k: v for k, v in r.items() if not k.startswith("_")}
+                                        for _, r in sorted(self.sources.items())]
+        if self.transport:
+            self.capture["queries"] = self.transport.queries
+            self.capture["timing"].update(
+                requests=self.transport.requests, query_records=len(self.transport.queries),
+                cache_hits=self.transport.reused,
+                reused_queries=self.transport.reused + self.capture["timing"].get("reused_query_assignments", 0))
+        self.capture["timing"]["total_seconds"] = max(0.0, time.monotonic() - self.start)
+
+
+def native_artifact_path(directory, raw):
+    """Raw reference authority is the explicit run root, never a captured root."""
+    if (not isinstance(raw, str) or not raw or raw.startswith(("/", "\\"))
+            or "\\" in raw or ":" in raw or any(part in ("", ".", "..") for part in raw.split("/"))):
+        raise EvidenceError("Native artifact reference must be a normalized relative path")
+    try:
+        _, path = source_path(directory, raw)
+    except SourcePathError as exc:
+        raise EvidenceError("Invalid run-root artifact reference: " + str(exc)) from None
+    return path
+
+
+async def collect_native_dependencies(
+        workspace, inventory_path, artifacts, *,
+        url=DEFAULT_URL, timeout=1800, max_queries=20000, max_pages=128,
+        page_size=100, hydration_batch_size=400, max_items=100000,
+        max_dependencies=500000, protected_paths=()):
+    """Capture direct native neighborhoods for every transverse inventory record."""
+    workspace = validate_workspace(workspace)
+    url = validate_url(url)
+    limits = {
+        "timeout": timeout, "max_queries": max_queries, "max_pages": max_pages,
+        "page_size": page_size, "hydration_batch_size": hydration_batch_size,
+        "max_items": max_items, "max_dependencies": max_dependencies,
+    }
+    if type(timeout) not in (float, int) or not math.isfinite(timeout) or not 1 <= timeout <= 86400:
+        raise EvidenceError("Native deadline must be finite within 1..86400 seconds")
+    for name, maximum in (("max_queries", 1000000), ("max_pages", 10000), ("page_size", 200),
+                          ("hydration_batch_size", 500), ("max_items", 1000000),
+                          ("max_dependencies", 5000000)):
+        if type(limits[name]) is not int or not 1 <= limits[name] <= maximum:
+            raise EvidenceError("Native budget outside allowed bounds: " + name)
+    inventory_path = Path(inventory_path).resolve(strict=True)
+    inventory, initial_inventory_digest = read_native_inventory(inventory_path)
+    raw_directory = Path(artifacts).absolute()
+    for ancestor in (raw_directory, *raw_directory.parents):
+        if ancestor.is_symlink() or (hasattr(ancestor, "is_junction") and ancestor.is_junction()):
+            raise EvidenceError("Run-artifact directory cannot use a symlink/junction alias")
+    directory = raw_directory.resolve()
+    protected = tuple(Path(p).resolve() for p in protected_paths)
+    if (directory.exists() or workspace.is_relative_to(directory)
+            or inventory_path.is_relative_to(directory)
+            or any(p.is_relative_to(directory) for p in protected)):
+        raise EvidenceError("Run-artifact directory must be new, distinct and not contain inputs/outputs/source root")
+    verify_output_input_separation(protected, [inventory_path, Path(__file__).resolve()])
+    run = NativeRun(workspace, directory, inventory_path, protected, limits, initial_inventory_digest)
+    run.diagnostic_queue(inventory)
+    directory.mkdir(parents=False, exist_ok=False)
+    manifest_path = directory / "run-manifest.json"
+    atomic_json(manifest_path, {"schema_version": 1, "kind": "lint-native-capture-run",
+                               "status": "pending", "workspace": str(workspace),
+                               "inventory_sha256": run.capture["inventory_sha256"],
+                               "limits": limits})
+    fatal = None
+    try:
+        async with asyncio.timeout_at(run.deadline):
+            async with connect(url, timeout) as session:
+                server = as_json((await session.initialize()).serverInfo)
+                tools = await catalog(session)
+                for name, data in (("server.json", server), ("catalogue.json", tools)):
+                    path = directory / name
+                    atomic_json(path, data)
+                    key = "server_ref" if name == "server.json" else "catalogue_ref"
+                    run.capture["backend"][key] = {"path": name, "sha256": sha256(path)}
+                run.transport = NativeCapture(session, tools, workspace, directory, max_queries, run.deadline)
+                async def stage(name, operation):
+                    start = time.monotonic()
+                    try:
+                        return await operation
+                    finally:
+                        run.capture["timing"]["stages"][name] = time.monotonic() - start
+                await stage("native_discovery", run.discover())
+                if not run.transport.stopped:
+                    await stage("initial_hydration", run.hydrate(run.tree))
+                start = time.monotonic()
+                run.select()
+                run.capture["timing"]["stages"]["selection"] = time.monotonic() - start
+                await stage("direct_relations", run.relations())
+    except TimeoutError:
+        run.stop_reason = "not_attempted_deadline"
+        if run.transport:
+            run.transport.stopped = run.stop_reason
+        run.capture["limitations"].append("Whole-operation deadline exhausted")
+    except EvidenceError as exc:
+        fatal = exc
+        run.capture["limitations"].append(str(exc))
+    except Exception as exc:
+        run.capture["limitations"].append("Backend/session unavailable: " + type(exc).__name__)
+    try:
+        if run.transport and run.relation_rows and not run.capture["dependencies"]:
+            run.dependencies()
+        for diagnostic in run.capture["diagnostics"]:
+            if diagnostic["attempt_outcome"] == "pending":
+                diagnostic["attempt_outcome"] = (
+                    run.stop_reason or (run.transport.stopped if run.transport else None) or "unavailable_backend")
+                diagnostic["reasons"].append("Capture ended before this diagnostic's relation scope completed")
+        run.finalize()
+        if sha256(inventory_path) != initial_inventory_digest:
+            raise EvidenceError("Inventory changed during native collection")
+        if git_head(workspace) != run.capture["target_head"]:
+            run.capture["limitations"].append("Target HEAD changed; no current global identity is asserted")
+        for query in run.capture["queries"]:
+            if sha256(native_artifact_path(directory, query["artifact"])) != query["artifact_sha256"]:
+                raise EvidenceError("Native query artifact changed before publication")
+        for key in ("server_ref", "catalogue_ref"):
+            ref = run.capture["backend"][key]
+            if ref and sha256(native_artifact_path(directory, ref["path"])) != ref["sha256"]:
+                raise EvidenceError("Native backend metadata changed before publication")
+    except EvidenceError as exc:
+        fatal = exc
+        run.capture["limitations"].append(str(exc))
+    incomplete = (fatal is not None or not run.transport or bool(run.transport.stopped)
+                  or any(q["status"] != "ok" or q["limitations"] for q in run.capture["queries"])
+                  or any(d["route"] == "transverse" and d["attempt_outcome"] not in ("queried", "reused_query")
+                         for d in run.capture["diagnostics"])
+                  or any(s["status"] != "verified" for s in run.capture["source_files"]))
+    run.capture["status"] = "failed" if fatal else "partial" if incomplete else "complete"
+    run.capture["backend"]["warnings"] = sorted(set(run.capture["backend"]["warnings"]))
+    if any(i["visibility"] not in (None, "pub") for i in run.capture["items"]):
+        run.capture["backend"]["coverage"]["private"] = "observed"
+    run.capture["limits"].update(
+        observed_items=len(run.capture["items"]), observed_dependencies=len(run.capture["dependencies"]),
+        max_source_file_bytes=MAX_RESULT_BYTES, max_source_bytes=MAX_SOURCE_BYTES,
+        pending_diagnostics=sum(d["attempt_outcome"].startswith("not_attempted") for d in run.capture["diagnostics"]))
+    if directory.resolve() != directory or directory.is_symlink():
+        raise CaptureIntegrityError("Run-artifact root changed into an alias during collection")
+    atomic_json(directory / "native-capture.json", run.capture)
+    atomic_json(manifest_path, {"schema_version": 1, "kind": "lint-native-capture-run",
+                               "status": run.capture["status"], "workspace": str(workspace),
+                               "capture": {"path": "native-capture.json", "sha256": sha256(directory / "native-capture.json")},
+                               "timing": run.capture["timing"]})
+    if fatal:
+        raise fatal
+    return run.capture
 
 
 def main(argv=None):

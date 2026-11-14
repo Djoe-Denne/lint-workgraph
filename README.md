@@ -18,6 +18,14 @@ edit.
 
 ## Included tools
 
+- [`lint-workgraph.py`](ops/scripts/lint-workgraph.py): the final whole-inventory
+  command, using the existing native Rust graph to collect dependencies and emit
+  a JSON work graph plus a readable report, without manual seeds or an origin
+  profile.
+- [`diagnostic-scope.py`](ops/scripts/diagnostic-scope.py): simple rule-based
+  local/transverse routing before dependency investigation. Documentation and
+  explicit mechanical exceptions are local; everything else defaults transverse.
+  See the [routing guide](docs/guides/diagnostic-scope.md).
 - [`github-lint-inventory.py`](ops/scripts/github-lint-inventory.py): optional
   read-only GitHub issue inventory.
 - [`clippy-sonar-overlap.py`](ops/scripts/clippy-sonar-overlap.py): strict,
@@ -32,6 +40,31 @@ edit.
 The output distinguishes qualified `hard_must_coedit` constraints from
 `candidate_dependency` observations. Candidate boundaries and unresolved evidence
 remain visible; missing edges do not certify independence.
+
+## Generate the graph from your complete inventory
+
+After producing an overlap inventory, run from this checkout with the pinned MCP
+SDK installed and the existing Rust MCP backend available:
+
+```powershell
+python -B ops/scripts/lint-workgraph.py `
+  --workspace "C:\src\your-rust-project" `
+  --inventory ".tmp\overlap.json" `
+  --output ".tmp\workgraph.json" `
+  --report ".tmp\workgraph.md"
+```
+
+The output parent must exist; the adjacent `workgraph.artifacts` directory must
+be new. Every input record is retained. Explicit local rules skip dedicated
+dependency lookup; all transverse records receive a query or a named unresolved
+outcome. Incoming/outgoing/import relations come from the native backend graph.
+See the [full command guide](docs/guides/full-inventory-graph.md).
+
+The real full-inventory run retained **1,046 records** and produced **256 file
+nodes, 517 candidate file edges and 289 distinct cross-file boundaries** from
+9,348 native observations. All transverse records were attempted; 126 source
+records remained unlocalized. Coverage is explicitly partial, not an exhaustive
+Rust dependency guarantee or automatic worker dispatch.
 
 ## Requirements and discovery
 
@@ -57,7 +90,7 @@ and 1 unknown mapping**. Default temporary outputs are removed on exit. See
 [the example guide](examples/README.md) to retain them in a new directory.
 This does not acquire real Clippy/Sonar data or close the cold-start gap.
 
-All **194 extracted offline tests** also pass with site packages disabled:
+The offline suites also run with site packages disabled:
 
 ```powershell
 python -S -B -m unittest discover -s ops/tests -p "test_*.py"
@@ -97,15 +130,15 @@ vault or private campaign artifacts are included.
 ## Important current limits
 
 This is an experimental extracted implementation, not a one-command fresh audit
-of an arbitrary Rust project. Clippy/Sonar acquisition, collection-plan generation
-and independent historical source binding are not yet a complete durable
-cold-start workflow.
+of an arbitrary Rust project. The final dependency command now discovers its
+own native scopes from the complete inventory. Clippy/Sonar acquisition and
+independent historical source binding are still outside that command.
 
-The live positive origin-binding profile remains tied to
+The legacy `produce --observations` positive origin-binding profile remains tied to
 `apparatus_contracts::runtime::validate_runtime_uid` and its expected compatibility
-layout. Generic offline planning can consume valid supplied evidence; this narrow
-live profile is not a general Rust resolver. Full macro/cfg/trait/feature/test
-reference coverage is not guaranteed.
+layout. The new `lint-workgraph.py` command does **not** require that profile;
+it uses generic native identities and current-source checks. Full
+macro/cfg/trait/feature/test reference coverage is not guaranteed.
 
 The extracted code was originally exercised on Windows. Other platforms and
 server-response formats require their own verification.

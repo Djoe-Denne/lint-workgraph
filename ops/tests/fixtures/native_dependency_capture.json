@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "kind": "lint-native-dependency-capture",
+  "status": "partial",
+  "workspace": "/synthetic/workspace",
+  "artifact_root": "/synthetic/run",
+  "orientation": "consumer_to_provider",
+  "inventory_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "captured_at": "2026-01-01T00:00:00+00:00",
+  "target_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "source_files": [
+    {"path": "src/lib.rs", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "before_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "after_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "status": "verified"}
+  ],
+  "backend": {
+    "server_ref": null,
+    "catalogue_ref": null,
+    "workspace_evidence": {"status": "requested_directory_only", "requested_workspace": "/synthetic/workspace"},
+    "snapshot_ids": ["synthetic-snapshot"],
+    "warnings": ["Invented backend age warning; current endpoint checks are separate."],
+    "coverage": {"private": "observed", "macros": "unknown", "traits": "unknown", "features": "unknown", "tests": "unknown", "freshness": "unknown"},
+    "scope": "direct_incoming_outgoing_imports_selected_transverse_items",
+    "context_refs": []
+  },
+  "queries": [
+    {"id": "nq000001", "tool": "rust-code-mcp_1mcp_build_codemap", "arguments": {"directory": "/synthetic/workspace", "seed_qualified_names": ["sample::work"], "depth": 0, "max_nodes": 500, "embedding_policy": "no_rerank", "format": "json", "include_snippets": false}, "artifact": "nq000001.json", "artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "status": "ok", "pagination": {"status": "not_applicable", "pages": 1, "returned": 1, "total": null, "reason": "Depth-zero node hydration, not dependency pagination"}, "limitations": [], "duration_seconds": 0.01, "reused_count": 0}
+  ],
+  "items": [
+    {"id": "ni000001", "native_id": [1, 2, 3], "selector": "sample::work", "kind": "Function", "visibility": "private", "path": "src/lib.rs", "range": {"start_byte": 0, "end_byte": 12, "start_line": 1, "end_line": 1, "column_unit": "utf8_byte"}, "location_status": "verified", "source_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "snapshot_id": "synthetic-snapshot", "native": {"file": "src/lib.rs", "span": [0, 12], "line": 1}, "evidence_refs": ["nq000001"], "reasons": []}
+  ],
+  "diagnostics": [
+    {"diagnostic_key": "clippy:C000001", "route": "transverse", "files": ["src/lib.rs"], "item_ids": ["ni000001"], "query_ids": ["nq000001"], "attempt_outcome": "unavailable_backend", "localization_status": "candidate", "reasons": ["Synthetic relation tools unavailable; no absence proof."]}
+  ],
+  "dependencies": [
+    {"id": "nd000001", "kind": "Uses", "origin_item_id": null, "destination_item_id": "ni000001", "origin_path": null, "destination_path": "src/lib.rs", "native_origin": {"selector": "sample::unknown_consumer"}, "native_destination": {"selector": "sample::work"}, "native": {"synthetic": true}, "evidence_refs": ["nq000001"], "qualification": "unresolved", "reasons": ["Synthetic unresolved native endpoint, not a source-verified edge."]}
+  ],
+  "limits": {"timeout": 1800, "max_queries": 20000, "max_pages": 128, "page_size": 100, "hydration_batch_size": 400, "max_items": 100000, "max_dependencies": 500000},
+  "timing": {"total_seconds": 0.01, "stages": {}, "requests": 1, "reused_queries": 0},
+  "limitations": ["Synthetic representation fixture; placeholder hashes are not accepted evidence."]
+}

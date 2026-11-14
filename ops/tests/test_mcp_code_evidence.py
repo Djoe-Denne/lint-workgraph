@@ -1303,6 +1303,471 @@ class ObservationTests(unittest.TestCase):
             self.assertEqual([], list(case.root.rglob(".mcp-evidence-*.tmp")))
 
 
+class NativeDependencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generic_inventory_buffer_keeps_strict_json_and_accepts_over_request_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.json"
+            raw = b'{"synthetic":true}\r\n' + b" " * (collector.MAX_INPUT_BYTES + 1)
+            path.write_bytes(raw)
+            parsed, digest = collector.read_native_inventory(path)
+            self.assertEqual({"synthetic": True}, parsed)
+            self.assertEqual(collector.hashlib.sha256(raw).hexdigest(), digest)
+            for raw in (b'{"a":1,"a":2}', b'{"a":NaN}', b'{"a":Infinity}', b'{"a":-Infinity}'):
+                path.write_bytes(raw)
+                with self.subTest(raw=raw), self.assertRaises(collector.EvidenceError):
+                    collector.read_native_inventory(path)
+
+    async def test_generic_inventory_buffer_read_is_bounded_before_parsing(self):
+        handle = Mock()
+        handle.read.return_value = b" " * 65
+        @contextmanager
+        def buffer():
+            yield handle
+        path = Mock()
+        path.open.return_value = buffer()
+        with patch.object(collector, "NATIVE_INVENTORY_MAX_BYTES", 64):
+            with self.assertRaisesRegex(collector.EvidenceError, "inventory exceeds"):
+                collector.read_native_inventory(path)
+        path.open.assert_called_once_with("rb")
+        handle.read.assert_called_once_with(65)
+
+    async def test_generic_inventory_replacement_after_parse_before_run_identity_is_fatal(self):
+        head = "a" * 40
+        # No Git/backend operation is needed to reproduce this inventory race.
+        with patch.object(sys.modules[__name__], "init_git", return_value=head), \
+                patch.object(collector, "validate_workspace", side_effect=lambda value: Path(value).resolve()), \
+                patch.object(collector, "git_head", return_value=head), self.native_case() as case:
+            initial_digest = collector.sha256(case.inventory)
+            replacement = json.loads(case.inventory.read_text())
+            replacement["clippy"][2]["rule"] = "clippy::too_many_lines"
+            original_run = collector.NativeRun
+            def replace_then_construct(*args, **kwargs):
+                case.inventory.write_text(json.dumps(replacement), encoding="utf-8")
+                return original_run(*args, **kwargs)
+            with patch.object(collector, "NativeRun", side_effect=replace_then_construct):
+                with self.assertRaisesRegex(collector.EvidenceError, "Inventory changed"):
+                    await self.collect_case(case)
+            captured = json.loads((case.root / "native-run/native-capture.json").read_text())
+            manifest = json.loads((case.root / "native-run/run-manifest.json").read_text())
+            self.assertEqual("failed", captured["status"])
+            self.assertEqual("failed", manifest["status"])
+            self.assertEqual(initial_digest, captured["inventory_sha256"])
+            self.assertNotEqual(collector.sha256(case.inventory), captured["inventory_sha256"])
+            old_route = next(d for d in captured["diagnostics"] if d["diagnostic_key"] == "clippy:C000003")
+            self.assertEqual(("local", "skipped_local"), (old_route["route"], old_route["attempt_outcome"]))
+
+    @contextmanager
+    def native_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            init_git(root)
+            (root / "src").mkdir()
+            source = (
+                "// Invented graph fixture.\n"
+                "pub fn work() { helper(); }\n"
+                "fn helper() {}\n"
+                "pub struct Packet;\n"
+                "pub trait Render { fn render(&self); }\n"
+                "impl Packet { pub fn send(&self) { work(); } }\n"
+                "mod nested { pub fn nested_work() {} }\n"
+            )
+            consumer = "pub fn outside() { helper(); }\n"
+            (root / "src/lib.rs").write_bytes(source.encode())
+            (root / "src/consumer.rs").write_bytes(consumer.encode())
+            (root / "src/empty.rs").write_text("// No indexed item.\n")
+            inventory = {
+                "schema_version": 1, "clippy": [], "sonar": [], "matches": [],
+                "counts": {"clippy_unique": 0, "sonar_unique_sites": 0, "sonar_raw_keys": 0,
+                           "exact_intersection": 0, "strict_union": 0},
+            }
+            specifications = [
+                ("too_many_lines", "src/lib.rs", [2, 0, 2, 10]),
+                ("too_many_lines", "src/lib.rs", [2, 0, 2, 10]),
+                ("doc_markdown", "src/lib.rs", [1, 0, 1, 10]),
+                ("struct_field_names", "src/lib.rs", [4, 0, 4, 10]),
+                ("arbitrary_unknown_rule", "src/lib.rs", [5, 0, 5, 10]),
+                ("too_many_arguments", "src/lib.rs", [6, 14, 6, 30]),
+                ("too_many_lines", "src/lib.rs", None),
+                ("too_many_lines", "src/empty.rs", None),
+                ("too_many_lines", "../outside.rs", None),
+            ]
+            for index, (rule, path, span) in enumerate(specifications, 1):
+                inventory["clippy"].append({
+                    "id": f"C{index:06d}", "rule": "clippy::" + rule, "message": "Synthetic",
+                    "primary_spans": [{"file": path, "range": span}],
+                })
+            inventory["counts"].update(clippy_unique=len(specifications), strict_union=len(specifications))
+            inventory_path = root / "inventory.json"
+            inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
+            nodes = []
+            def node(name, kind, text, file="src/lib.rs", visibility="private"):
+                data = (root / file).read_bytes()
+                start = data.index(text.encode())
+                entry = {
+                    "id": [len(nodes) + 1] * 32, "qualified_name": name,
+                    "kind": "Item", "item_kind": kind, "file": file.replace("/", "\\"),
+                    "span": [start, start + len(text.encode())],
+                    "line": data[:start].count(b"\n") + 1,
+                }
+                nodes.append(entry)
+                return {"qualified_name": name, "kind": "Item." + kind,
+                        "item_kind": "Item." + kind, "visibility": visibility, "children": []}
+            tree_nodes = [
+                node("garden::work", "Function", "pub fn work() { helper(); }", visibility="pub"),
+                node("garden::helper", "Function", "fn helper() {}"),
+                node("garden::Packet", "Struct", "pub struct Packet;", visibility="pub"),
+                node("garden::Render", "Trait", "pub trait Render { fn render(&self); }", visibility="pub"),
+                node("garden::Packet::send", "Method", "pub fn send(&self) { work(); }"),
+                node("garden::nested", "Module", "mod nested { pub fn nested_work() {} }"),
+                node("garden::nested::nested_work", "Function", "pub fn nested_work() {}"),
+                node("garden::outside", "Function", "pub fn outside() { helper(); }", "src/consumer.rs"),
+            ]
+            case = SimpleNamespace(
+                root=root, inventory=inventory_path, nodes=nodes,
+                tree={"qualified_name": "garden", "kind": "Crate", "item_kind": None,
+                      "visibility": "pub", "children": tree_nodes},
+                before_query=None, mutate_page=None, output=root / "accepted.json",
+            )
+            yield case
+
+    def native_session(self, case):
+        properties = {
+            "crate_dependency_metric": {"directory", "limit", "offset", "summary", "sort_by", "top_n"},
+            "crate_edges": {"directory", "limit", "offset", "summary"},
+            "module_tree": {"directory", "krate", "depth"},
+            "build_codemap": {"directory", "seed_qualified_names", "depth", "max_nodes",
+                              "max_incoming_per_node", "embedding_policy", "format",
+                              "include_snippets", "task_prompt", "embedding_profile"},
+            "who_uses": {"directory", "target", "offset", "limit", "summary"},
+            "calls_from": {"directory", "caller", "offset", "limit", "summary"},
+            "who_imports": {"directory", "target", "offset", "limit", "summary"},
+        }
+        tools = [{"name": "rust-code-mcp_1mcp_" + name, "inputSchema": {
+            "properties": {key: {} for key in keys}, "required": ["directory"]}}
+            for name, keys in properties.items()]
+        fake = session(tools=tools)
+        async def call(exact, arguments):
+            name = exact.removeprefix("rust-code-mcp_1mcp_")
+            if case.before_query:
+                value = case.before_query(name, arguments)
+                if value:
+                    await value
+            def page(rows, key, selector_key=None):
+                offset, limit = arguments["offset"], arguments["limit"]
+                values = rows[offset:offset + limit]
+                payload = {"total_match_count": len(rows), "returned_match_count": len(values),
+                           "offset": offset, "limit": limit, "summary": False, key: values}
+                if selector_key:
+                    payload[selector_key] = arguments[selector_key]
+                if case.mutate_page:
+                    case.mutate_page(name, arguments, payload)
+                return payload
+            if name == "crate_dependency_metric":
+                payload = page([{"crate_name": "garden", "item_count": len(case.nodes)}], "metrics")
+            elif name == "crate_edges":
+                payload = {"edges": []}
+            elif name == "module_tree":
+                payload = {"tree": case.tree}
+            elif name == "build_codemap":
+                seeds = set(arguments["seed_qualified_names"])
+                payload = {
+                    "snapshot_id": "synthetic-native-snapshot",
+                    "nodes": [n for n in case.nodes if n["qualified_name"] in seeds],
+                    "edges": [], "diagnostics": ["Invented stale-backend warning, not a current source verdict"],
+                }
+            elif name == "who_uses":
+                rows = []
+                if arguments["target"] == "garden::helper":
+                    for file, caller in (("src/lib.rs", "garden::work"), ("src/consumer.rs", "garden::outside")):
+                        data = (case.root / file).read_bytes()
+                        start = data.index(b"helper();")
+                        rows.append({"file": file, "start": start, "end": start + len("helper"),
+                                     "category": "Other", "consumer_module": "garden",
+                                     "consumer_function": caller})
+                payload = page(rows, "usages", "target")
+            elif name == "calls_from":
+                rows = []
+                if arguments["caller"] == "garden::work":
+                    start = (case.root / "src/lib.rs").read_bytes().index(b"helper();")
+                    rows = [{"caller_qualified_name": "garden::work", "callee_qualified_name": "garden::helper",
+                             "file": "src/lib.rs", "start": start, "end": start + len("helper"), "category": "Other"}]
+                payload = page(rows, "call_sites", "caller")
+            else:
+                rows = ([{"visible_name": "helper", "namespace": "Value", "kind": "GlobImport",
+                          "visibility": "pub", "from_module": "garden::nested",
+                          "target": "garden::helper", "target_kind": "Item.Fn"}]
+                        if arguments["target"] == "garden::helper" else [])
+                payload = page(rows, "bindings", "target")
+            return result(text=json.dumps(payload))
+        fake.call_tool.side_effect = call
+        return fake
+
+    async def collect_case(self, case, **overrides):
+        fake = self.native_session(case)
+        @asynccontextmanager
+        async def fake_connect(url, timeout):
+            yield fake
+        directory = overrides.pop("artifacts", case.root / "native-run")
+        with patch.object(collector, "connect", fake_connect):
+            captured = await collector.collect_native_dependencies(
+                case.root, case.inventory, directory, **overrides)
+        return captured, fake
+
+    async def test_generic_all_records_types_queries_reuse_and_outside_endpoints(self):
+        with self.native_case() as case:
+            captured, fake = await self.collect_case(case, hydration_batch_size=2, page_size=1)
+            self.assertEqual("consumer_to_provider", captured["orientation"])
+            representation = json.loads((Path(__file__).parent / "fixtures/native_dependency_capture.json").read_text())
+            self.assertEqual(set(representation), set(captured))
+            self.assertEqual(9, len(captured["diagnostics"]))
+            self.assertFalse(any(d["attempt_outcome"] == "pending" for d in captured["diagnostics"]))
+            self.assertEqual("skipped_local", captured["diagnostics"][2]["attempt_outcome"])
+            self.assertEqual("reused_query", captured["diagnostics"][1]["attempt_outcome"])
+            self.assertEqual({"Function", "Struct", "Trait", "Method", "Module"},
+                             {i["kind"] for i in captured["items"] if i["location_status"] == "verified"})
+            self.assertTrue(any(d["qualification"] == "source_verified" for d in captured["dependencies"]))
+            self.assertTrue(any(d["origin_path"] == "src/consumer.rs" for d in captured["dependencies"]))
+            self.assertTrue(captured["backend"]["warnings"])
+            self.assertTrue(all(d["localization_status"] != "exact" for d in captured["diagnostics"]))
+            for call in fake.call_tool.call_args_list:
+                name, args = call.args[0], call.kwargs["arguments"]
+                self.assertEqual(str(case.root), args["directory"])
+                if name.endswith("build_codemap"):
+                    self.assertEqual({
+                        "directory", "seed_qualified_names", "depth", "max_nodes",
+                        "embedding_policy", "format", "include_snippets"}, set(args))
+                    self.assertLessEqual(len(args["seed_qualified_names"]), 2)
+                    self.assertEqual(0, args["depth"])
+                    self.assertEqual(500, args["max_nodes"])
+                    self.assertEqual("no_rerank", args["embedding_policy"])
+                    self.assertEqual("json", args["format"])
+                    self.assertIs(False, args["include_snippets"])
+                elif name.endswith("module_tree"):
+                    self.assertEqual({"directory": str(case.root), "krate": "garden"}, args)
+                elif name.endswith("crate_dependency_metric"):
+                    self.assertNotIn("top_n", args)
+                elif name.endswith("crate_edges"):
+                    self.assertEqual({"directory": str(case.root), "offset": 0,
+                                      "limit": 1, "summary": False}, args)
+            context = next(q for q in captured["queries"] if q["tool"].endswith("crate_edges"))
+            self.assertEqual("partial", context["pagination"]["status"])
+            self.assertIn("not global", context["pagination"]["reason"])
+            self.assertEqual(captured, json.loads((case.root / "native-run/native-capture.json").read_text()))
+
+    async def test_generic_invented_hydration_argument_names_rejected_before_transmission(self):
+        with self.native_case() as case:
+            fake = self.native_session(case)
+            tools = [model.data for model in fake.list_tools.return_value.tools]
+            directory = case.root / "argument-rejection"
+            directory.mkdir()
+            capture = collector.NativeCapture(
+                fake, tools, case.root, directory, 10, collector.time.monotonic() + 30)
+            for wrong in (
+                {"directory": str(case.root), "seeds": ["garden::work"], "depth": 0, "max_nodes": 500},
+                {"directory": str(case.root), "seed_qualified_names": ["garden::work"],
+                 "max_depth": 0, "max_nodes": 500},
+            ):
+                payload, query = await capture.query("build_codemap", wrong)
+                self.assertIsNone(payload)
+                self.assertEqual("unsupported", query["status"])
+                self.assertIn("schema drift", " ".join(query["limitations"]))
+            fake.call_tool.assert_not_awaited()
+
+    async def test_generic_local_only_file_retained_without_dedicated_relation_queries(self):
+        with self.native_case() as case:
+            source = b"pub fn local_only() {}\n"
+            (case.root / "src/local.rs").write_bytes(source)
+            case.nodes.append({"id": [101] * 32, "qualified_name": "garden::local_only",
+                               "kind": "Item", "item_kind": "Function", "file": "src/local.rs",
+                               "span": [0, len(source) - 1], "line": 1})
+            case.tree["children"].append({
+                "qualified_name": "garden::local_only", "kind": "Item.Function",
+                "item_kind": "Item.Function", "visibility": "pub", "children": []})
+            inventory = json.loads(case.inventory.read_text())
+            inventory["clippy"].append({
+                "id": "C000010", "rule": "clippy::doc_markdown", "message": "Synthetic local only",
+                "primary_spans": [{"file": "src/local.rs", "range": [1, 0, 1, 10]}]})
+            inventory["counts"].update(clippy_unique=10, strict_union=10)
+            case.inventory.write_text(json.dumps(inventory))
+            captured, fake = await self.collect_case(case)
+            record = next(d for d in captured["diagnostics"] if d["diagnostic_key"] == "clippy:C000010")
+            self.assertEqual(["src/local.rs"], record["files"])
+            self.assertEqual("skipped_local", record["attempt_outcome"])
+            for call in fake.call_tool.call_args_list:
+                self.assertNotEqual("garden::local_only", call.kwargs["arguments"].get("target"))
+                self.assertNotEqual("garden::local_only", call.kwargs["arguments"].get("caller"))
+
+    async def test_generic_run_artifacts_outside_target_and_hash_refs(self):
+        with self.native_case() as case, tempfile.TemporaryDirectory() as external:
+            root = Path(external).resolve() / "external-run"
+            captured, _ = await self.collect_case(case, artifacts=root)
+            self.assertEqual(str(root), captured["artifact_root"])
+            for query in captured["queries"]:
+                self.assertEqual(query["artifact_sha256"],
+                                 collector.sha256(collector.native_artifact_path(root, query["artifact"])))
+            for raw in ("../escape", "/absolute", r"a\b", "C:/absolute"):
+                with self.assertRaises(collector.EvidenceError):
+                    collector.native_artifact_path(root, raw)
+
+    async def test_generic_budget_stops_entire_transverse_queue_explicitly(self):
+        with self.native_case() as case:
+            captured, _ = await self.collect_case(case, max_queries=1)
+            self.assertEqual(9, len(captured["diagnostics"]))
+            transverse = [d for d in captured["diagnostics"] if d["route"] == "transverse"]
+            self.assertTrue(all(d["attempt_outcome"] == "not_attempted_budget" for d in transverse))
+            self.assertEqual(1, len(captured["queries"]))
+
+    async def test_generic_wrong_roots_and_output_source_aliases_before_transport(self):
+        with self.native_case() as case:
+            with patch.object(collector, "connect") as connect:
+                for root in (".", case.root / "src"):
+                    with self.assertRaises(collector.EvidenceError):
+                        await collector.collect_native_dependencies(root, case.inventory, case.root / "unused")
+                with self.assertRaises(collector.EvidenceError):
+                    await collector.collect_native_dependencies(
+                        case.root, case.inventory, case.root / "unused",
+                        protected_paths=[case.root / "src/lib.rs"])
+                connect.assert_not_called()
+
+    async def test_generic_source_drift_is_preserved_not_source_verified(self):
+        with self.native_case() as case:
+            changed = False
+            def mutate(name, args):
+                nonlocal changed
+                if name == "who_uses" and not changed:
+                    with (case.root / "src/lib.rs").open("a") as handle:
+                        handle.write("// Changed after initial source hash.\n")
+                    changed = True
+            case.before_query = mutate
+            captured, _ = await self.collect_case(case)
+            self.assertTrue(any(s["status"] == "changed" for s in captured["source_files"]))
+            self.assertFalse(any(d["qualification"] == "source_verified" and
+                                 "src/lib.rs" in (d["origin_path"], d["destination_path"])
+                                 for d in captured["dependencies"]))
+            self.assertTrue(any(d["attempt_outcome"] == "source_invalid" for d in captured["diagnostics"]))
+
+    async def test_generic_bad_span_remains_backend_observed_not_dropped(self):
+        with self.native_case() as case:
+            node = next(n for n in case.nodes if n["qualified_name"] == "garden::helper")
+            node["span"][0] += 1
+            captured, _ = await self.collect_case(case)
+            facts = [d for d in captured["dependencies"] if d["native_destination"].get("selector") == "garden::helper"]
+            self.assertTrue(facts)
+            self.assertTrue(any(d["qualification"] == "backend_observed" for d in facts))
+            self.assertFalse(any(d["qualification"] == "source_verified" for d in facts))
+
+    async def test_generic_pagination_gaps_repeats_total_drift_never_promote_bad_page(self):
+        for variant in ("gap", "repeat", "total"):
+            with self.subTest(variant=variant), self.native_case() as case:
+                def mutate(name, args, payload):
+                    if name == "who_uses" and args["target"] == "garden::helper" and args["offset"] == 1:
+                        if variant == "gap":
+                            payload["offset"] = 2
+                        elif variant == "total":
+                            payload["total_match_count"] += 1
+                        else:
+                            first = (case.root / "src/lib.rs").read_bytes().index(b"helper();")
+                            payload["usages"][0].update(file="src/lib.rs", start=first,
+                                                       end=first + len("helper"), consumer_function="garden::work")
+                case.mutate_page = mutate
+                captured, _ = await self.collect_case(case, page_size=1)
+                broken = [q for q in captured["queries"] if q["status"] == "unsupported"]
+                self.assertTrue(broken)
+                ids = {q["id"] for q in broken}
+                self.assertFalse(any(d["qualification"] == "source_verified" and ids.intersection(d["evidence_refs"])
+                                     for d in captured["dependencies"]))
+
+    async def test_generic_timeout_retains_partial_capture_and_all_diagnostic_outcomes(self):
+        with self.native_case() as case:
+            async def slow():
+                await asyncio.sleep(2)
+            case.before_query = lambda name, args: slow() if name == "module_tree" else None
+            captured, _ = await self.collect_case(case, timeout=1)
+            self.assertEqual(9, len(captured["diagnostics"]))
+            self.assertFalse(any(d["attempt_outcome"] == "pending" for d in captured["diagnostics"]))
+            self.assertTrue(any(d["attempt_outcome"] == "not_attempted_deadline" for d in captured["diagnostics"]))
+            self.assertTrue((case.root / "native-run/native-capture.json").exists())
+
+    async def test_generic_ambiguous_native_ids_never_pick_the_first_match(self):
+        with self.native_case() as case:
+            original = next(n for n in case.nodes if n["qualified_name"] == "garden::helper")
+            case.nodes.append(dict(original, id=[99] * 32))
+            captured, _ = await self.collect_case(case)
+            matches = [i for i in captured["items"] if i["selector"] == "garden::helper" and i["native_id"]]
+            self.assertEqual(2, len(matches))
+            facts = [d for d in captured["dependencies"] if d["native_destination"].get("selector") == "garden::helper"]
+            self.assertTrue(facts)
+            self.assertTrue(all(d["destination_item_id"] is None and d["qualification"] != "source_verified"
+                                for d in facts))
+
+    async def test_generic_importer_without_native_location_stays_unresolved(self):
+        with self.native_case() as case:
+            case.nodes = [n for n in case.nodes if n["qualified_name"] != "garden::nested"]
+            captured, _ = await self.collect_case(case)
+            imports = [d for d in captured["dependencies"] if d["kind"] == "GlobImport"]
+            self.assertEqual(1, len(imports))
+            self.assertEqual("unresolved", imports[0]["qualification"])
+            self.assertIsNone(imports[0]["origin_path"])
+            self.assertEqual("garden::nested", imports[0]["native_origin"]["selector"])
+
+    async def test_generic_query_error_is_not_zero_or_whole_queue_abort(self):
+        with self.native_case() as case:
+            def fail(name, args):
+                if name == "calls_from" and args["caller"] == "garden::work":
+                    raise RuntimeError("Synthetic unsupported item behavior")
+            case.before_query = fail
+            captured, _ = await self.collect_case(case)
+            self.assertEqual(9, len(captured["diagnostics"]))
+            self.assertTrue(any(q["status"] == "error" for q in captured["queries"]))
+            self.assertTrue(captured["dependencies"])
+            self.assertTrue(any("not applicable" in reason for item in captured["items"]
+                                if item["kind"] == "Struct" for reason in item["reasons"]))
+            self.assertEqual("partial", captured["status"])
+
+    async def test_generic_discovered_source_hardlink_output_collision_is_fatal(self):
+        with self.native_case() as case:
+            os.link(case.root / "src/consumer.rs", case.output)
+            before = case.output.read_bytes()
+            with self.assertRaises(collector.EvidenceError):
+                await self.collect_case(case, protected_paths=[case.output])
+            self.assertEqual(before, case.output.read_bytes())
+            failed = json.loads((case.root / "native-run/native-capture.json").read_text())
+            self.assertEqual("failed", failed["status"])
+            self.assertEqual(9, len(failed["diagnostics"]))
+
+    async def test_generic_input_and_raw_capture_drift_are_fatal_not_accepted(self):
+        for variant in ("inventory", "raw"):
+            with self.subTest(variant=variant), self.native_case() as case:
+                changed = False
+                def mutate(name, args):
+                    nonlocal changed
+                    if name == "who_uses" and not changed:
+                        path = (case.inventory if variant == "inventory" else
+                                case.root / "native-run/nq000001.json")
+                        path.write_text("{}")
+                        changed = True
+                case.before_query = mutate
+                with self.assertRaises(collector.EvidenceError):
+                    await self.collect_case(case)
+                self.assertEqual("failed", json.loads(
+                    (case.root / "native-run/native-capture.json").read_text())["status"])
+
+    async def test_generic_initialization_deadline_accounts_for_every_record(self):
+        with self.native_case() as case:
+            fake = self.native_session(case)
+            async def slow_init():
+                await asyncio.sleep(2)
+            fake.initialize.side_effect = slow_init
+            @asynccontextmanager
+            async def fake_connect(url, timeout):
+                yield fake
+            with patch.object(collector, "connect", fake_connect):
+                captured = await collector.collect_native_dependencies(
+                    case.root, case.inventory, case.root / "native-run", timeout=1)
+            self.assertTrue(all(d["attempt_outcome"] == "not_attempted_deadline"
+                                for d in captured["diagnostics"] if d["route"] == "transverse"))
+
+
 class ProducerAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_origin_lookups_cannot_forward_arbitrary_or_fuzzy_requests(self):
         with tempfile.TemporaryDirectory() as directory:

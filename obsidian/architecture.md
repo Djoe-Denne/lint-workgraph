@@ -16,6 +16,20 @@ evidence and coverage remain evaluation criteria. See [[backlog]].
 
 ## Stages
 
+Before dependency investigation, `diagnostic-scope.py` applies a simple rule
+policy: known documentation and explicit local mechanical exceptions are local;
+all other rules, including unknown rules, are transverse by default.
+It does not inspect function signatures/bodies or certify independence.
+Its routing artifact is a selection input, not an automatic rewrite of a saved
+MCP collection plan or an approved co-edit constraint.
+
+The final `lint-workgraph.py` command applies this policy directly, enumerates
+native crates/items without manual seeds, hydrates their locations and queries
+direct incoming/outgoing/import relations for every transverse diagnostic scope.
+It reuses the existing collector and native HIR graph, not a second semantic
+engine. A generic capture is validated and assembled into file coupling and
+tentative ownership groups; legacy origin-proof artifacts remain a separate path.
+
 1. **Input inventory.** Read captured Clippy JSONL and complete Sonar pages.
    Keep original issue provenance, strict aliases and uncertain matches.
 2. **Source and MCP evidence.** Select an explicit target workspace, capture

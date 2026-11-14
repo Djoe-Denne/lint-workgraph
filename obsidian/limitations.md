@@ -12,6 +12,10 @@ There is no complete durable sequence that starts from an arbitrary untouched
 Rust project, acquires Clippy/Sonar data, prepares every collection/binding input,
 and emits the graph. See [[reproduction-gap]].
 
+The final dependency stage is now runnable over the complete supplied inventory
+with automatic native discovery. It no longer requires a manual seed/source
+plan. Upstream acquisition and independent historical equivalence remain separate.
+
 ## Coverage and identity
 
 - Pagination completeness describes a particular query, not all references.
@@ -24,13 +28,14 @@ and emits the graph. See [[reproduction-gap]].
 
 ## Source-specific live origin profile
 
-The current positive live file-origin profile is tied to the compatibility target
+The legacy `produce --observations` live file-origin profile is tied to the compatibility target
 `apparatus_contracts::runtime::validate_runtime_uid` and its expected default
 crate/module layout. It is not a general Rust name resolver.
 Explicit workspace portability does not remove this profile limitation.
 
-Generic offline graph construction can consume schema-valid supplied evidence,
-but automatic live origin binding is narrower.
+The new `lint-workgraph.py` command is not bound to that legacy profile. It uses
+the native graph's identities and locations, with separate current-source and
+coverage checks. Unsupported cases remain visible rather than guessed.
 
 ## Partitioning
 

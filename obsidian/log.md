@@ -19,3 +19,10 @@ status: active
   [Djoe-Denne/lint-workgraph](https://github.com/Djoe-Denne/lint-workgraph)
   repository. Verified PUBLIC visibility, default branch `master` and the initial
   remote commit `e1bccc17d4c04cb77e28fb3daa8b0a02bfd4dff6`. See [[history]].
+- 2026-11-14 — Added user-requested simple local/transverse rule routing. All 77
+  observed rule types classified without source/dependency lookup: strict union
+  328 local and 292 transverse. See [[history]].
+- 2026-11-14 — Generalized the final dependency command to the whole real
+  inventory using the existing native graph: 256 files, 517 candidate edges and
+  289 cross-file boundaries. All transverse records attempted; coverage remains
+  partial. Reused the completed capture for final graph/report publication.
