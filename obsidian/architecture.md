@@ -30,6 +30,15 @@ It reuses the existing collector and native HIR graph, not a second semantic
 engine. A generic capture is validated and assembled into file coupling and
 tentative ownership groups; legacy origin-proof artifacts remain a separate path.
 
+After graph export, `partition-workgraph.py` selects practical correction lots
+offline. Strict diagnostic units supply file workload weights; exact aliases
+count once. LPT initializes loads, then deterministic file moves/swaps minimize
+overload, verified cross-lot affinity and finally load variance in that order.
+Only distinct verified writable-file pairs drive affinity. Other native
+observations remain coordination witnesses, not hard co-edit constraints.
+One file has one write owner; ambiguous paths remain manual and context-only
+files are shared read-only. Lot count is not worker concurrency.
+
 1. **Input inventory.** Read captured Clippy JSONL and complete Sonar pages.
    Keep original issue provenance, strict aliases and uncertain matches.
 2. **Source and MCP evidence.** Select an explicit target workspace, capture

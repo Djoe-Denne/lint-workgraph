@@ -26,3 +26,6 @@ status: active
   inventory using the existing native graph: 256 files, 517 candidate edges and
   289 cross-file boundaries. All transverse records attempted; coverage remains
   partial. Reused the completed capture for final graph/report publication.
+- 2026-11-14 — Added offline balanced lot selection: 12 proposed lots, 598 units
+  assigned and 22 manual; verified affinity cut 82 → 36. Parent real CLI repeat
+  deterministic outside timing, 271 tests PASS and bounded independent review PASS.

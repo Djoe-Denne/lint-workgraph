@@ -66,6 +66,28 @@ nodes, 517 candidate file edges and 289 distinct cross-file boundaries** from
 records remained unlocalized. Coverage is explicitly partial, not an exhaustive
 Rust dependency guarantee or automatic worker dispatch.
 
+## Select balanced correction lots
+
+Reuse that saved graph offline, without another MCP collection:
+
+```powershell
+python -B ops/scripts/partition-workgraph.py `
+  --graph ".tmp\workgraph.json" `
+  --output ".tmp\correction-lots.json" `
+  --report ".tmp\correction-lots.md"
+```
+
+The stdlib heuristic seeds balanced loads with LPT, then improves cross-lot
+coupling through deterministic file moves/swaps. Default target is 50 strict
+units per lot; use `--target-issues N` or `--parts K` to change it. Files remain
+indivisible, with one write owner; outside context is read-only.
+
+On the real graph it produced **12 lots, 47–59 units each**, assigning 598 units
+to 131 files and queuing 22 ambiguous-path units. Verified affinity cuts fell
+from **82 to 36** in about **0.76 seconds**. This is a measured heuristic
+improvement, not a global optimum or permission to dispatch corrections.
+See the [lot selection guide](docs/guides/partition-workgraph.md).
+
 ## Requirements and discovery
 
 Use Python 3.11+ and Git. The offline planner and synthetic fixture mechanics do

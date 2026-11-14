@@ -40,8 +40,10 @@ or an assertion that either backend is a drop-in equivalent.
 
 ## Work allocation
 
-- [ ] Evaluate partition proposals against meaningful workload/affinity inputs.
-- [ ] Keep mandatory file ownership separate from candidate dependency coupling.
+- [x] Implement measured lot optimization using strict-unit workload proxies and
+      verified distinct file-pair affinity; compare with the LPT baseline.
+- [x] Keep exclusive file ownership separate from soft candidate dependency
+      coupling and shared read-only context.
 - [ ] Define scheduling/resource metadata without claiming dependency arrows are
       an execution DAG.
 - [ ] Keep correction/dispatch outside the planner unless separately authorized.

@@ -136,3 +136,26 @@ An inventory read/hash race and a quadratic raw/source alias check were correcte
 with regressions. Partial backend coverage, stale-snapshot warnings and unresolved
 native endpoints remain explicit. No index rebuild, source corrections, hard
 co-edit unions or correction-worker dispatch occurred.
+
+## Correction-lot selection and optimization
+
+Research compared balanced graph partitioning with community detection. METIS
+is an established native fit, but its current PyPI release has no official
+Windows wheel. For this small POC, the implementation avoids adding a native
+toolchain or environment and uses LPT followed by bounded deterministic
+move/swap refinement. Research links and the precise objective are in the
+partitioning guide and contract; this is not a METIS reimplementation.
+
+On the actual saved graph, 620 strict units became 598 assigned units plus
+22 manual-path units. The 131 verified editable files have exclusive owners;
+120 context-only nodes have none. Default target 50 produced 12 proposed lots,
+loads 47–59 and capacity 60. Across 87 eligible verified affinity pairs, the
+cross-lot cut decreased from 82 to 36, with zero overload.
+
+Thirty-three improvements reached a local move/swap optimum. Parent real CLI
+repeat completed in 0.764 seconds, with identical non-timing output and unchanged
+graph input. All 271 offline tests passed. Independent correctness review checked
+gain calculations on 150 small graphs and reconciled the real manifest.
+
+Lots retain directed boundary witnesses, read-only context and review tasks.
+No sources were corrected, agents dispatched or global optimality claimed.
