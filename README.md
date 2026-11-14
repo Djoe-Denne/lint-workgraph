@@ -88,6 +88,32 @@ from **82 to 36** in about **0.76 seconds**. This is a measured heuristic
 improvement, not a global optimum or permission to dispatch corrections.
 See the [lot selection guide](docs/guides/partition-workgraph.md).
 
+## Run the campaign through your agent's native tools
+
+Load the portable
+[lint-workgraph-campaign skill](.agents/skills/lint-workgraph-campaign/SKILL.md)
+in the target project's agent session. It requires think-as-code and Context Mode
+for bulk processing, reuses the existing scripts, and adapts only the host-tool
+transport. It does not install a framework, grant permissions or launch workers
+from Python.
+
+If the neighboring checkout's skill is not discoverable, tell your agent:
+
+> Read `<lint-workgraph checkout>/.agents/skills/lint-workgraph-campaign/SKILL.md`
+> and its adapter. Work against `<target checkout>` and its project policies.
+> Prepare a correction wave from the existing lots; stop before launching workers.
+
+The offline `ops/scripts/campaign-wave.py` helper selects mutually nonconflicting
+lots using **all known boundaries**, respects active leases/completed state,
+and emits action requests plus a shared read-only Accepted-resolution CSV.
+New decision proposals remain separate until lead review between waves.
+See the [command, input schemas and host pattern](docs/guides/campaign-wave.md).
+
+Real planning verification selected six lots from the saved twelve-lot manifest
+using 24 known conflict pairs, preserving the 22 manual units. The empty decision
+registry deliberately produced a header-only CSV, not invented precedents.
+Native Codex/Pi/OpenCode execution has not been certified.
+
 ## Requirements and discovery
 
 Use Python 3.11+ and Git. The offline planner and synthetic fixture mechanics do

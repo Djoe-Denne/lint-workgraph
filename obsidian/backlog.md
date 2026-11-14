@@ -46,7 +46,11 @@ or an assertion that either backend is a drop-in equivalent.
       coupling and shared read-only context.
 - [ ] Define scheduling/resource metadata without claiming dependency arrows are
       an execution DAG.
-- [ ] Keep correction/dispatch outside the planner unless separately authorized.
+- [x] Add portable skill and deterministic wave requests using all known
+      boundaries, generation-bound active/completed state and a read-only CSV.
+- [x] Keep correction/dispatch outside the planner unless separately authorized.
+- [ ] Validate actual native execution on supported hosts; simulated capability
+      tests and documented discovery are not runtime certification.
 
 ## Project lifecycle
 

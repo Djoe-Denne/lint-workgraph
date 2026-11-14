@@ -29,3 +29,6 @@ status: active
 - 2026-11-14 — Added offline balanced lot selection: 12 proposed lots, 598 units
   assigned and 22 manual; verified affinity cut 82 → 36. Parent real CLI repeat
   deterministic outside timing, 271 tests PASS and bounded independent review PASS.
+- 2026-11-14 — Added portable campaign skill and offline wave requests. Real
+  planning retained 24 conflict pairs and selected six mutually nonconflicting
+  lots with cap six; 287 tests PASS. No correction or native agent launch.

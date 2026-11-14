@@ -74,6 +74,19 @@ would create a circular hash dependency.
 
 ## Trust and safety boundaries
 
+The portable campaign skill delegates deterministic wave planning to
+`campaign-wave.py` through Context Mode, then leaves approved execution to the
+host's actual tools. Scheduling uses all known cross-lot boundaries and write
+overlaps, not just the optimization affinity projection. Generation-bound state
+separates active leases from lead-accepted/integrated completion. Dry-runs reserve
+nothing; the lead rechecks and acquires exclusive leases before native execution.
+
+Accepted resolutions are caller-normalized into a common read-only CSV snapshot.
+Project skills remain authoritative separately. Workers propose new decisions
+per lot; only the lead reviews and merges them between waves. Missing Context
+Mode blocks bulk work. No Python-to-host API, global configuration or new
+framework is introduced. See [[history]] for the verified planning boundary.
+
 Explicit target-root selection, reported MCP root checks, source/hash replay,
 bounded queries, root-confined references and output alias checks protect the
 evidence workflow. Unknown language/index coverage remains explicit.

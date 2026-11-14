@@ -159,3 +159,24 @@ gain calculations on 150 small graphs and reconciled the real manifest.
 
 Lots retain directed boundary witnesses, read-only context and review tasks.
 No sources were corrected, agents dispatched or global optimality claimed.
+
+## Portable campaign skill and wave planning
+
+The new project skill requires think-as-code/Context Mode and a thin host
+adaptation pattern, reusing the existing graph/lot tools. The offline helper
+emits plans, native action requests and an Accepted-only read-only resolution
+CSV, without launching agents or changing sources.
+
+Parent real replay retained all 24 known inter-lot conflict pairs, not merely
+the 11 source-verified pairs. Cap six selected lots 007, 004, 006, 012, 003 and
+011 in 0.144 seconds; default cap one selected 007. No selected pair had a known
+boundary. Inputs and all 598 assigned/22 manual units remained unchanged.
+The CSV was deliberately header-only because no accepted decisions were supplied.
+All 287 offline tests passed; the repeated wave identity matched.
+
+Primary Codex, Pi and OpenCode documentation supports project `.agents/skills`
+discovery. A neighboring repository's skill requires explicit loading/manual
+reading; it is not automatically discoverable in the target. Capability tests
+are simulated, not native cross-client execution proof. Plans reserve no leases.
+Independent correctness review passed: state, all-edge conflicts, CSV, hashes,
+output guards and the actual saved replay matched the parent oracle.
