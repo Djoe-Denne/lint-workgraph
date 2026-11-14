@@ -1,0 +1,43 @@
+# Local runs and private captures
+.tmp/
+artifacts/
+captures/
+private/
+*.log
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+*.pem
+*.key
+*.p12
+
+# Python runtime and test state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Agent/session state is not part of the public project
+.cursor/
+.headroom/
+
+# Obsidian vault content/config is versioned; personal runtime state is not
+obsidian/.obsidian/workspace*.json
+obsidian/.obsidian/graph.json
+obsidian/.obsidian/hotkeys.json
+obsidian/.obsidian/cache/
+obsidian/.obsidian/plugins/
+obsidian/.obsidian/community-plugins.json
+obsidian/.trash/
+
+# Desktop state
+.DS_Store
+Thumbs.db
+desktop.ini
